@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"path"
 	"regexp"
@@ -21,6 +22,7 @@ import (
 )
 
 type nativeStreamAsset struct {
+	kind        string
 	address     string
 	data        []byte
 	contentType string
@@ -30,14 +32,16 @@ type nativeStreamAsset struct {
 }
 
 type nativeStreamSession struct {
-	credentials *providerMediaCredentials
-	mu          sync.Mutex
-	assets      map[string]nativeStreamAsset
-	referer     string
-	key         []byte
-	ctx         context.Context
-	cancel      context.CancelFunc
-	lastUsed    time.Time
+	credentials  *providerMediaCredentials
+	mu           sync.Mutex
+	assets       map[string]nativeStreamAsset
+	referer      string
+	key          []byte
+	ctx          context.Context
+	cancel       context.CancelFunc
+	lastUsed     time.Time
+	diagnosticID string
+	created      time.Time
 }
 
 type nativeStreamServer struct {
@@ -51,7 +55,25 @@ type nativeStreamServer struct {
 func (stream *nativeStreamServer) nativeRequest(request *http.Request) (*http.Response, error) {
 	client := *stream.downloader.client
 	client.Timeout = 0
-	return stream.downloader.doMediaRequestWithClient(request, &client)
+	info, _ := request.Context().Value(nativeStreamDiagnosticKey{}).(nativeStreamDiagnostic)
+	if info.started.IsZero() {
+		info.started = time.Now()
+	}
+	info.method = request.Method
+	stream.nativeLog(info, "upstream_start", request.URL.String(), "", 0, "")
+	request = request.WithContext(httptrace.WithClientTrace(request.Context(), stream.nativeTrace(info, request.URL.String())))
+	response, err := stream.downloader.doMediaRequestWithClient(request, &client)
+	if err != nil {
+		stream.nativeLog(info, "upstream_error", request.URL.String(), "error="+nativeStreamError(err), 0, "")
+		return response, err
+	}
+	address := request.URL.String()
+	if response.Request != nil && response.Request.URL != nil {
+		address = response.Request.URL.String()
+	}
+	stream.nativeLog(info, "upstream_headers", address, "", response.StatusCode, response.Header.Get("Content-Type"))
+	response.Body = &nativeDiagnosticBody{ReadCloser: response.Body, stream: stream, info: info, address: address}
+	return response, nil
 }
 
 var nativePlaylistURI = regexp.MustCompile(`URI="([^"]+)"`)
@@ -75,11 +97,11 @@ func (stream *nativeStreamServer) nativeOpen(media providerMedia) (string, strin
 	}
 	token := hex.EncodeToString(tokenBytes)
 	ctx, cancel := context.WithCancel(providerMediaContext(context.Background(), media.credentials))
-	session := &nativeStreamSession{assets: map[string]nativeStreamAsset{}, referer: media.Referer, key: media.HLSKey, ctx: ctx, cancel: cancel, lastUsed: time.Now(), credentials: media.credentials}
+	session := &nativeStreamSession{assets: map[string]nativeStreamAsset{}, referer: media.Referer, key: media.HLSKey, ctx: ctx, cancel: cancel, lastUsed: time.Now(), credentials: media.credentials, diagnosticID: nativeStreamID(token), created: time.Now()}
 	stream.mu.Lock()
 	for id, old := range stream.sessions {
 		if time.Since(old.lastUsed) > 10*time.Minute {
-			old.cancel()
+			stream.nativeCancel(old, "idle_expired")
 			delete(stream.sessions, id)
 		}
 	}
@@ -90,19 +112,14 @@ func (stream *nativeStreamServer) nativeOpen(media providerMedia) (string, strin
 				oldest = id
 			}
 		}
-		stream.sessions[oldest].cancel()
+		stream.nativeCancel(stream.sessions[oldest], "capacity_eviction")
 		delete(stream.sessions, oldest)
 	}
 	stream.sessions[token] = session
 	stream.mu.Unlock()
-	entry := nativeStreamAsset{address: media.URL, contentType: "video/mp4"}
-	isHLS := media.Playlist != "" || len(media.HLSKey) > 0
-	if parsed, err := url.Parse(media.URL); err == nil {
-		pathLower := strings.ToLower(parsed.Path)
-		if strings.HasSuffix(pathLower, ".m3u8") {
-			isHLS = true
-		}
-	}
+	entry := nativeStreamAsset{kind: "media", address: media.URL, contentType: "video/mp4"}
+	parsedURL, parseErr := url.Parse(media.URL)
+	isHLS := media.Playlist != "" || (parseErr == nil && strings.HasSuffix(strings.ToLower(parsedURL.Path), ".m3u8"))
 	if isHLS {
 		entry.contentType = "application/vnd.apple.mpegurl"
 	}
@@ -110,13 +127,22 @@ func (stream *nativeStreamServer) nativeOpen(media providerMedia) (string, strin
 		entry.data = []byte(media.Playlist)
 		entry.contentType = "application/vnd.apple.mpegurl"
 	}
+	if isHLS || strings.Contains(entry.contentType, "mpegurl") {
+		entry.kind = "entry_playlist"
+	}
+	stream.nativeLog(nativeStreamDiagnostic{session: session.diagnosticID, asset: entry.kind, started: session.created}, "session_open", media.URL, "", 0, "")
 	return stream.nativeAsset(token, session, entry), token
+}
+
+func (stream *nativeStreamServer) nativeCancel(session *nativeStreamSession, reason string) {
+	stream.nativeLog(nativeStreamDiagnostic{session: session.diagnosticID, started: session.created}, "session_cancel", "", "reason="+reason, 0, "")
+	session.cancel()
 }
 
 func (stream *nativeStreamServer) nativeRelease(token string) {
 	stream.mu.Lock()
 	if session := stream.sessions[token]; session != nil {
-		session.cancel()
+		stream.nativeCancel(session, "release")
 		delete(stream.sessions, token)
 	}
 	stream.mu.Unlock()
@@ -169,7 +195,16 @@ func (stream *nativeStreamServer) nativeRewrite(token string, session *nativeStr
 			if !isProviderHTTPMediaURL(address) {
 				return ""
 			}
-			asset := nativeStreamAsset{address: address, contentType: contentType}
+			kind := "segment"
+			switch contentType {
+			case "application/vnd.apple.mpegurl":
+				kind = "child_playlist"
+			case "application/octet-stream":
+				kind = "key"
+			case "video/mp4":
+				kind = "map"
+			}
+			asset := nativeStreamAsset{kind: kind, address: address, contentType: contentType}
 			if key && len(session.key) == 16 {
 				asset.data = append([]byte{}, session.key...)
 				asset.contentType = "application/octet-stream"
@@ -219,6 +254,17 @@ func (stream *nativeStreamServer) nativeRewrite(token string, session *nativeStr
 }
 
 func (stream *nativeStreamServer) nativeServe(writer http.ResponseWriter, request *http.Request) {
+	info := nativeStreamDiagnostic{request: nativeStreamRequestID.Add(1), started: time.Now(), method: request.Method, asset: "unknown"}
+	observed := &nativeDiagnosticWriter{ResponseWriter: writer}
+	writer = observed
+	stream.nativeLog(info, "local_request", "", "", 0, "")
+	defer func() {
+		status := observed.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		stream.nativeLog(info, "local_response", "", fmt.Sprintf("bytes=%d write_error=%s client_context=%s", observed.bytes, nativeStreamError(observed.err), nativeStreamError(request.Context().Err())), status, writer.Header().Get("Content-Type"))
+	}()
 	if request.Method != http.MethodGet && request.Method != http.MethodHead {
 		writer.WriteHeader(http.StatusMethodNotAllowed)
 		return
@@ -228,6 +274,7 @@ func (stream *nativeStreamServer) nativeServe(writer http.ResponseWriter, reques
 		http.NotFound(writer, request)
 		return
 	}
+	info.session = nativeStreamID(parts[0])
 	stream.mu.Lock()
 	session := stream.sessions[parts[0]]
 	if session != nil {
@@ -241,12 +288,16 @@ func (stream *nativeStreamServer) nativeServe(writer http.ResponseWriter, reques
 	session.mu.Lock()
 	asset, found := session.assets[parts[1]]
 	session.mu.Unlock()
+	info.session = session.diagnosticID
+	info.asset = asset.kind
+	stream.nativeLog(info, "asset_request", asset.address, "", 0, asset.contentType)
 	if !found {
 		http.NotFound(writer, request)
 		return
 	}
 	ctx, cancel := context.WithCancel(providerMediaContext(request.Context(), session.credentials))
 	defer cancel()
+	ctx = context.WithValue(ctx, nativeStreamDiagnosticKey{}, info)
 	stop := context.AfterFunc(session.ctx, cancel)
 	defer stop()
 	writer.Header().Set("Cache-Control", "no-store")
@@ -259,6 +310,7 @@ func (stream *nativeStreamServer) nativeServe(writer http.ResponseWriter, reques
 	if len(asset.data) > 0 {
 		if strings.Contains(asset.contentType, "mpegurl") {
 			body, err := stream.nativeRewrite(parts[0], session, string(asset.data), asset.address)
+			stream.nativeLog(info, "playlist_rewrite", asset.address, "kind="+nativePlaylistKind(string(asset.data))+" error="+nativeStreamError(err), 0, "")
 			if err != nil {
 				http.Error(writer, err.Error(), http.StatusBadGateway)
 				return
@@ -290,31 +342,14 @@ func (stream *nativeStreamServer) nativeServe(writer http.ResponseWriter, reques
 	}
 	response, err := stream.nativeRequest(upstream)
 	if err != nil {
-		errStr := err.Error()
-		if stream.downloader != nil {
-			stream.downloader.recordDiagnostic(diagnosticEvent{
-				Event:   "stream_upstream_error",
-				Host:    upstream.URL.Host,
-				Message: fmt.Sprintf("代理上游媒体失败: %v, url: %s", err, asset.address),
-			})
-		}
-		writer.Header().Set("X-App-Error", errStr)
-		http.Error(writer, fmt.Sprintf("读取媒体失败: %v", err), http.StatusBadGateway)
+		http.Error(writer, "读取媒体失败，请重试", http.StatusBadGateway)
 		return
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusPartialContent {
 		body, _ := io.ReadAll(io.LimitReader(response.Body, 64<<10))
 		err := stream.downloader.catalogResponseError(upstream, response, body)
-		errStr := err.Error()
-		stream.downloader.recordDiagnostic(diagnosticEvent{
-			Event:      "stream_upstream_status",
-			Host:       upstream.URL.Host,
-			HTTPStatus: response.StatusCode,
-			Message:    fmt.Sprintf("上游返回错误状态: %d, err: %v", response.StatusCode, err),
-		})
-		writer.Header().Set("X-App-Error", errStr)
-		http.Error(writer, errStr, response.StatusCode)
+		http.Error(writer, err.Error(), response.StatusCode)
 		return
 	}
 	contentType := strings.ToLower(response.Header.Get("Content-Type"))
@@ -322,12 +357,17 @@ func (stream *nativeStreamServer) nativeServe(writer http.ResponseWriter, reques
 	if response.Request != nil && response.Request.URL != nil {
 		finalURL = response.Request.URL
 	}
-	playlist := strings.Contains(asset.contentType, "mpegurl") || strings.Contains(contentType, "mpegurl") || strings.HasSuffix(strings.ToLower(finalURL.Path), ".m3u8") || strings.Contains(strings.ToLower(finalURL.String()), "m3u8") || len(session.key) > 0
+	contentIsMP4 := strings.Contains(contentType, "video/mp4")
+	playlist := strings.Contains(contentType, "mpegurl") ||
+		(strings.HasSuffix(strings.ToLower(finalURL.Path), ".m3u8") && !contentIsMP4)
 	reader := bufio.NewReader(response.Body)
-	if !playlist && request.Method == http.MethodGet {
+	if request.Method == http.MethodGet {
 		peek, _ := reader.Peek(512)
-		if strings.HasPrefix(strings.TrimSpace(strings.TrimPrefix(string(peek), "\ufeff")), "#EXTM3U") {
+		bodyIsPlaylist := strings.HasPrefix(strings.TrimSpace(strings.TrimPrefix(string(peek), "\ufeff")), "#EXTM3U")
+		if bodyIsPlaylist {
 			playlist = true
+		} else if contentIsMP4 {
+			playlist = false
 		}
 	}
 	if playlist && request.Method == http.MethodHead {
@@ -338,31 +378,24 @@ func (stream *nativeStreamServer) nativeServe(writer http.ResponseWriter, reques
 	if playlist && request.Method == http.MethodGet {
 		body, err := io.ReadAll(io.LimitReader(reader, 4<<20+1))
 		if err != nil || len(body) > 4<<20 {
+			stream.nativeLog(info, "playlist_read_failed", finalURL.String(), "error="+nativeStreamError(err), 0, contentType)
 			http.Error(writer, "播放列表过大或读取失败", http.StatusBadGateway)
 			return
 		}
 		text := strings.TrimSpace(strings.TrimPrefix(string(body), "\ufeff"))
-		if strings.HasPrefix(text, "#EXTM3U") {
-			rewritten, err := stream.nativeRewrite(parts[0], session, text, finalURL.String())
-			if err != nil {
-				http.Error(writer, err.Error(), http.StatusBadGateway)
-				return
-			}
-			writer.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-			_, _ = io.WriteString(writer, rewritten)
+		if !strings.HasPrefix(text, "#EXTM3U") {
+			stream.nativeLog(info, "playlist_invalid", finalURL.String(), "", 0, contentType)
+			http.Error(writer, "播放列表无效", http.StatusBadGateway)
 			return
 		}
-		fullReader := io.MultiReader(bytes.NewReader(body), reader)
-		for _, name := range []string{"Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "ETag", "Last-Modified"} {
-			if value := response.Header.Get(name); value != "" {
-				writer.Header().Set(name, value)
-			}
+		rewritten, err := stream.nativeRewrite(parts[0], session, text, finalURL.String())
+		stream.nativeLog(info, "playlist_rewrite", finalURL.String(), "kind="+nativePlaylistKind(text)+" error="+nativeStreamError(err), 0, contentType)
+		if err != nil {
+			http.Error(writer, err.Error(), http.StatusBadGateway)
+			return
 		}
-		if !strings.Contains(strings.ToLower(writer.Header().Get("Content-Type")), "video") {
-			writer.Header().Set("Content-Type", "video/mp4")
-		}
-		writer.WriteHeader(response.StatusCode)
-		_, _ = io.Copy(writer, fullReader)
+		writer.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		_, _ = io.WriteString(writer, rewritten)
 		return
 	}
 	for _, name := range []string{"Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "ETag", "Last-Modified"} {
@@ -372,6 +405,9 @@ func (stream *nativeStreamServer) nativeServe(writer http.ResponseWriter, reques
 	}
 	writer.WriteHeader(response.StatusCode)
 	if request.Method == http.MethodGet {
-		_, _ = io.Copy(writer, reader)
+		_, err := io.Copy(writer, reader)
+		if err != nil {
+			stream.nativeLog(info, "transfer_error", finalURL.String(), "error="+nativeStreamError(err), 0, contentType)
+		}
 	}
 }

@@ -472,6 +472,8 @@ func nativeDispatch(input nativeInput) (any, error) {
 			return engine.nativeNextPlayback(playback, input.Session)
 		}
 		return engine.nativeResolve(playback, input)
+	case "followCheck":
+		return engine.nativeFollowCheck(ctx, input.Drama)
 	case "cancelPlayback":
 		engine.nativeCancelPlayback(input.Sequence)
 		return true, nil
@@ -670,7 +672,7 @@ func (engine *nativeEngine) nativeCatalog(ctx context.Context, input nativeInput
 		items, result.HasMore, err = d.fetchHuangguoAICatalogPage(ctx, page, category)
 	case sourceHuangju:
 		items, result.HasMore, err = d.fetchHuangjuCatalogPage(ctx, page, category, "")
-	case sourceYeguo:
+		case sourceYeguo:
 		items, result.HasMore, err = d.fetchYeguoCatalogPage(ctx, page, category, "")
 	case sourceDSD:
 		items, result.HasMore, err = d.fetchDSDCatalogPage(ctx, page, category, "")
